@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <!-- Parking area background -->
+  <rect width="640" height="360" fill="#0c0c10"/>
+  <!-- Ground / parking lot -->
+  <rect x="0" y="200" width="640" height="160" fill="#111118"/>
+  <!-- Parking bay lines -->
+  <line x1="100" y1="200" x2="100" y2="360" stroke="#1f2937" stroke-width="1.5"/>
+  <line x1="220" y1="200" x2="220" y2="360" stroke="#1f2937" stroke-width="1.5"/>
+  <line x1="340" y1="200" x2="340" y2="360" stroke="#1f2937" stroke-width="1.5"/>
+  <line x1="460" y1="200" x2="460" y2="360" stroke="#1f2937" stroke-width="1.5"/>
+  <line x1="580" y1="200" x2="580" y2="360" stroke="#1f2937" stroke-width="1.5"/>
+  <!-- Parked cars -->
+  <rect x="110" y="220" width="100" height="55" rx="5" fill="#1e293b"/>
+  <rect x="230" y="220" width="100" height="55" rx="5" fill="#1e293b"/>
+  <!-- Unattended object (bag) -->
+  <rect x="358" y="235" width="40" height="28" rx="4" fill="#292524"/>
+  <ellipse cx="378" cy="235" rx="16" ry="6" fill="#3c3330"/>
+  <line x1="362" y1="235" x2="394" y2="235" stroke="#57534e" stroke-width="2"/>
+  <!-- Detection box around unattended object -->
+  <rect x="348" y="225" width="60" height="48" fill="none" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6,3"/>
+  <polyline points="348,225 348,238 361,238" fill="none" stroke="#f59e0b" stroke-width="2.5"/>
+  <polyline points="396,225 408,225 408,238" fill="none" stroke="#f59e0b" stroke-width="2.5"/>
+  <polyline points="348,261 348,273 361,273" fill="none" stroke="#f59e0b" stroke-width="2.5"/>
+  <polyline points="396,261 408,261 408,273" fill="none" stroke="#f59e0b" stroke-width="2.5"/>
+  <!-- Timer label next to object -->
+  <rect x="412" y="230" width="72" height="22" rx="3" fill="#78350f"/>
+  <text x="448" y="245" font-family="monospace" font-size="11" fill="#fbbf24" text-anchor="middle">00:07:32</text>
+  <!-- Overhead light cone -->
+  <polygon points="320,0 200,200 440,200" fill="#fbbf2406"/>
+  <circle cx="320" cy="10" r="8" fill="#fef3c7" opacity="0.6"/>
+  <!-- HUD: top bar -->
+  <rect x="0" y="0" width="640" height="36" fill="#00000088"/>
+  <text x="12" y="23" font-family="monospace" font-size="13" fill="#f59e0b">● REC</text>
+  <text x="80" y="23" font-family="monospace" font-size="13" fill="#d1d5db">CAM-003 | ZONE C — PARKING AREA</text>
+  <text x="490" y="23" font-family="monospace" font-size="12" fill="#6b7280">2026-09-29 14:55:18</text>
+  <!-- HUD: bottom bar -->
+  <rect x="0" y="324" width="640" height="36" fill="#00000088"/>
+  <text x="12" y="347" font-family="monospace" font-size="11" fill="#f59e0b">⚠ UNATTENDED OBJECT DETECTED — STATIONARY FOR 07:32 — HUMAN REVIEW REQUIRED</text>
+  <!-- Simulated watermark -->
+  <text x="320" y="310" font-family="monospace" font-size="10" fill="#374151" text-anchor="middle" opacity="0.5">SIMULATED EVIDENCE — PROTOTYPE FUNCTIONALITY</text>
+</svg>

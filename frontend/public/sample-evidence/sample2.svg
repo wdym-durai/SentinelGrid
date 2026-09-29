@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <!-- Night-vision style background -->
+  <rect width="640" height="360" fill="#050d05"/>
+  <!-- Fence/perimeter line -->
+  <line x1="0" y1="220" x2="640" y2="220" stroke="#1a3a1a" stroke-width="2"/>
+  <line x1="80" y1="160" x2="80" y2="270" stroke="#1a3a1a" stroke-width="3"/>
+  <line x1="200" y1="150" x2="200" y2="270" stroke="#1a3a1a" stroke-width="3"/>
+  <line x1="320" y1="148" x2="320" y2="270" stroke="#1a3a1a" stroke-width="3"/>
+  <line x1="440" y1="150" x2="440" y2="270" stroke="#1a3a1a" stroke-width="3"/>
+  <line x1="560" y1="155" x2="560" y2="270" stroke="#1a3a1a" stroke-width="3"/>
+  <!-- Ground -->
+  <rect x="0" y="270" width="640" height="90" fill="#071207"/>
+  <!-- Object near perimeter -->
+  <rect x="390" y="180" width="55" height="38" rx="4" fill="#1a3a1a"/>
+  <rect x="395" y="185" width="45" height="28" rx="2" fill="#0d2310"/>
+  <!-- Detection box around object -->
+  <rect x="382" y="172" width="72" height="56" fill="none" stroke="#22c55e" stroke-width="2" stroke-dasharray="6,3"/>
+  <polyline points="382,172 382,185 395,185" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+  <polyline points="440,172 454,172 454,185" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+  <polyline points="382,214 382,228 395,228" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+  <polyline points="440,214 454,214 454,228" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+  <!-- Night-vision scan lines -->
+  <rect x="0" y="0" width="640" height="360" fill="url(#scanlines)" opacity="0.08"/>
+  <defs>
+    <pattern id="scanlines" width="2" height="4" patternUnits="userSpaceOnUse">
+      <rect width="2" height="2" fill="#00ff00"/>
+    </pattern>
+  </defs>
+  <!-- Green tint overlay for night-vision look -->
+  <rect width="640" height="360" fill="#00ff0008"/>
+  <!-- HUD: top bar -->
+  <rect x="0" y="0" width="640" height="36" fill="#00000099"/>
+  <text x="12" y="23" font-family="monospace" font-size="13" fill="#22c55e">● REC</text>
+  <text x="80" y="23" font-family="monospace" font-size="13" fill="#4ade80">CAM-002 | ZONE B — NORTH PERIMETER</text>
+  <text x="478" y="23" font-family="monospace" font-size="12" fill="#166534">2026-09-29 14:41:52 | IR</text>
+  <!-- HUD: bottom bar -->
+  <rect x="0" y="324" width="640" height="36" fill="#00000099"/>
+  <text x="12" y="347" font-family="monospace" font-size="11" fill="#22c55e">⚠ PERIMETER PROXIMITY ALERT — OBJECT DETECTED NEAR BOUNDARY</text>
+  <!-- Range indicator -->
+  <line x1="454" y1="200" x2="530" y2="200" stroke="#22c55e" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="470" y="196" font-family="monospace" font-size="10" fill="#22c55e">~4.2m</text>
+  <!-- Simulated watermark -->
+  <text x="320" y="300" font-family="monospace" font-size="10" fill="#166534" text-anchor="middle" opacity="0.5">SIMULATED EVIDENCE — PROTOTYPE FUNCTIONALITY</text>
+</svg>

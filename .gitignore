@@ -1,0 +1,20 @@
+# Dependencies — never commit these, they are huge and can be reinstalled
+node_modules/
+
+# Environment variable files — NEVER commit these, they may contain secrets
+.env
+.env.local
+.env.production
+
+# Build output
+dist/
+build/
+
+# Editor/OS files
+.DS_Store
+.vscode/
+*.log
+
+# AWS credentials — these should NEVER be in the repo
+.aws/
+aws-credentials.json

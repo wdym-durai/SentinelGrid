@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+  <!-- Camera feed background -->
+  <rect width="640" height="360" fill="#0d1117"/>
+  <!-- Simulated camera grid lines -->
+  <line x1="0" y1="120" x2="640" y2="120" stroke="#1f2937" stroke-width="1"/>
+  <line x1="0" y1="240" x2="640" y2="240" stroke="#1f2937" stroke-width="1"/>
+  <line x1="213" y1="0" x2="213" y2="360" stroke="#1f2937" stroke-width="1"/>
+  <line x1="427" y1="0" x2="427" y2="360" stroke="#1f2937" stroke-width="1"/>
+  <!-- Scene: doorway silhouette -->
+  <rect x="240" y="80" width="160" height="220" rx="4" fill="#1a2234"/>
+  <rect x="260" y="100" width="120" height="180" rx="2" fill="#0a0e1a"/>
+  <!-- Figure silhouette -->
+  <ellipse cx="320" cy="145" rx="22" ry="22" fill="#374151"/>
+  <rect x="298" y="167" width="44" height="70" rx="8" fill="#374151"/>
+  <rect x="283" y="172" width="18" height="50" rx="6" fill="#374151"/>
+  <rect x="339" y="172" width="18" height="50" rx="6" fill="#374151"/>
+  <rect x="299" y="237" width="18" height="45" rx="6" fill="#374151"/>
+  <rect x="323" y="237" width="18" height="45" rx="6" fill="#374151"/>
+  <!-- Motion detection box -->
+  <rect x="250" y="90" width="140" height="220" fill="none" stroke="#ef4444" stroke-width="2" stroke-dasharray="8,4"/>
+  <!-- Corner brackets -->
+  <polyline points="250,90 250,110 270,110" fill="none" stroke="#ef4444" stroke-width="3"/>
+  <polyline points="370,90 390,90 390,110" fill="none" stroke="#ef4444" stroke-width="3"/>
+  <polyline points="250,290 250,310 270,310" fill="none" stroke="#ef4444" stroke-width="3"/>
+  <polyline points="370,290 390,290 390,310" fill="none" stroke="#ef4444" stroke-width="3"/>
+  <!-- HUD overlay: top bar -->
+  <rect x="0" y="0" width="640" height="36" fill="#00000088"/>
+  <text x="12" y="23" font-family="monospace" font-size="13" fill="#ef4444">● REC</text>
+  <text x="80" y="23" font-family="monospace" font-size="13" fill="#9ca3af">CAM-001 | ZONE A — MAIN ENTRANCE</text>
+  <text x="500" y="23" font-family="monospace" font-size="12" fill="#6b7280">2026-09-29 14:32:07</text>
+  <!-- HUD overlay: bottom bar -->
+  <rect x="0" y="324" width="640" height="36" fill="#00000088"/>
+  <text x="12" y="347" font-family="monospace" font-size="11" fill="#ef4444">⚠ UNUSUAL ACTIVITY DETECTED — AWAITING HUMAN VERIFICATION</text>
+  <!-- Alert pulse ring -->
+  <circle cx="320" cy="200" r="90" fill="none" stroke="#ef4444" stroke-width="1.5" opacity="0.3"/>
+  <circle cx="320" cy="200" r="110" fill="none" stroke="#ef4444" stroke-width="1" opacity="0.15"/>
+  <!-- Simulated watermark -->
+  <text x="320" y="195" font-family="monospace" font-size="10" fill="#374151" text-anchor="middle" opacity="0.6">SIMULATED EVIDENCE</text>
+</svg>
