@@ -10,7 +10,8 @@
  *   │  StatsBar (open / verified / dismissed) │
  *   ├─────────────────┬───────────────────────┤
  *   │  IncidentFeed   │  IncidentDetail       │
- *   │  (left panel)   │  (right panel)        │
+ *   │  (left panel)   │  ActivityLog          │
+ *   │                 │  (right panel)        │
  *   ├─────────────────┴───────────────────────┤
  *   │  EventSimulator  [PROTOTYPE INPUT]       │
  *   └─────────────────────────────────────────┘
@@ -21,6 +22,7 @@ import StatsBar from './components/StatsBar';
 import IncidentFeed from './components/IncidentFeed';
 import IncidentDetail from './components/IncidentDetail';
 import EventSimulator from './components/EventSimulator';
+import ActivityLog from './components/ActivityLog';
 
 const API_BASE = '/incidents';
 
@@ -29,6 +31,21 @@ export default function App() {
   const [selectedIncident, setSelectedIncident] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [logs, setLogs] = useState([]);
+
+  // ── Add a timestamped entry to the activity log ───────────────────────────
+  const addLog = useCallback((type, incident, operator = null) => {
+    setLogs((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${Math.random()}`,
+        type,
+        incidentTitle: incident.title,
+        operator,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+  }, []);
 
   // ── Fetch all incidents from the backend ──────────────────────────────────
   const fetchIncidents = useCallback(async () => {
@@ -36,8 +53,25 @@ export default function App() {
       const response = await fetch(API_BASE);
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
       const data = await response.json();
-      setIncidents(data.incidents || []);
+      const fetched = data.incidents || [];
+      setIncidents(fetched);
       setError(null);
+
+      // On first load only (when logs is empty), log pre-existing incidents
+      setLogs((prevLogs) => {
+        if (prevLogs.length > 0) return prevLogs; // already seeded
+        return fetched.map((inc) => ({
+          id: `preload-${inc.id}`,
+          type: inc.status === 'VERIFIED'
+            ? 'verified'
+            : inc.status === 'DISMISSED'
+            ? 'dismissed'
+            : 'preloaded',
+          incidentTitle: inc.title,
+          operator: inc.verifiedBy || null,
+          timestamp: inc.createdAt,
+        }));
+      });
     } catch (err) {
       console.error('Failed to fetch incidents:', err);
       setError('Unable to connect to backend. Is it running on port 3001?');
@@ -57,6 +91,7 @@ export default function App() {
   const handleNewIncident = (incident) => {
     setIncidents((prev) => [incident, ...prev]);
     setSelectedIncident(incident); // auto-select the new incident
+    addLog('created', incident);
   };
 
   // ── Handle verify/dismiss from IncidentDetail ─────────────────────────────
@@ -65,6 +100,8 @@ export default function App() {
       prev.map((inc) => (inc.id === updatedIncident.id ? updatedIncident : inc))
     );
     setSelectedIncident(updatedIncident);
+    const type = updatedIncident.status === 'VERIFIED' ? 'verified' : 'dismissed';
+    addLog(type, updatedIncident, updatedIncident.verifiedBy);
   };
 
   // ── Sync selectedIncident when the incidents list updates ─────────────────
@@ -97,6 +134,10 @@ export default function App() {
             <span className="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             LIVE
           </div>
+          {/* System mode indicator */}
+          <span className="text-xs bg-gray-800 text-gray-400 border border-gray-600 px-2 py-1 rounded font-mono">
+            LOCAL MOCK MODE
+          </span>
           {/* Prototype badge */}
           <span className="text-xs bg-yellow-900 text-yellow-300 border border-yellow-700 px-2 py-1 rounded font-mono">
             PROTOTYPE
@@ -133,12 +174,13 @@ export default function App() {
           />
         </div>
 
-        {/* Right panel — incident detail */}
-        <div className="flex-1 overflow-y-auto">
+        {/* Right panel — incident detail + activity log */}
+        <div className="flex-1 flex flex-col gap-4 overflow-y-auto">
           <IncidentDetail
             incident={selectedIncident}
             onIncidentUpdated={handleIncidentUpdated}
           />
+          <ActivityLog logs={logs} />
         </div>
       </main>
 
