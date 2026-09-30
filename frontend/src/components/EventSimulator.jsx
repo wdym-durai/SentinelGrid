@@ -65,7 +65,7 @@ export default function EventSimulator({ onNewIncident }) {
     setLastResult(null);
 
     try {
-      const response = await fetch('/incidents', {
+      const response = await fetch('https://sentinelgrid-2l30.onrender.com/incidents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

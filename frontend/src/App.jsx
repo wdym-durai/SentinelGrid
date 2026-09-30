@@ -24,7 +24,7 @@ import IncidentDetail from './components/IncidentDetail';
 import EventSimulator from './components/EventSimulator';
 import ActivityLog from './components/ActivityLog';
 
-const API_BASE = '/incidents';
+const API_BASE = 'https://sentinelgrid-2l30.onrender.com/incidents';
 
 export default function App() {
   const [incidents, setIncidents] = useState([]);
