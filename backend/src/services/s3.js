@@ -22,6 +22,8 @@
 
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const fs = require('fs');
+const path = require('path');
 
 // Credentials are read automatically from the AWS CLI configuration.
 // We do NOT hardcode credentials here.
@@ -69,4 +71,46 @@ async function getEvidenceUrl(key) {
   return signedUrl;
 }
 
-module.exports = { uploadEvidence, getEvidenceUrl };
+module.exports = { uploadEvidence, getEvidenceUrl, uploadEvidenceFromPath };
+
+/**
+ * Reads a simulated evidence SVG from disk and uploads it to S3.
+ *
+ * IMPORTANT: This uploads SIMULATED / PROTOTYPE evidence only.
+ * The source files are pre-made SVG graphics, not real camera captures.
+ * They are clearly labeled as simulated within the SVG content itself.
+ *
+ * Called only when USE_AWS=true. Never called in Local Mock Mode.
+ *
+ * @param {string} filename   — the SVG filename, e.g. "sample1.svg"
+ * @param {string} incidentId — the UUID of the incident being created
+ * @returns {{ s3Key: string, presignedUrl: string }}
+ *   s3Key        — the object key stored in DynamoDB, e.g. "evidence/<incidentId>/sample1.svg"
+ *   presignedUrl — a temporary HTTPS URL the frontend can use to display the image (1 hour TTL)
+ */
+async function uploadEvidenceFromPath(filename, incidentId) {
+  // Resolve the absolute path to the SVG file on disk.
+  // The SVGs live in frontend/public/sample-evidence/ relative to the repo root.
+  // __dirname is backend/src/services/, so we walk up three levels to reach the repo root.
+  const filePath = path.resolve(
+    __dirname,
+    '../../../frontend/public/sample-evidence',
+    filename
+  );
+
+  // Read the file into a Buffer (synchronous — acceptable for prototype scale)
+  const fileBuffer = fs.readFileSync(filePath);
+
+  // Build a unique S3 key scoped to this incident so each upload is distinct
+  const s3Key = `evidence/${incidentId}/${filename}`;
+
+  // Upload to S3
+  await uploadEvidence(s3Key, fileBuffer, 'image/svg+xml');
+
+  // Generate a presigned URL so the frontend can load it directly from S3
+  const presignedUrl = await getEvidenceUrl(s3Key);
+
+  return { s3Key, presignedUrl };
+}
+
+module.exports = { uploadEvidence, getEvidenceUrl, uploadEvidenceFromPath };

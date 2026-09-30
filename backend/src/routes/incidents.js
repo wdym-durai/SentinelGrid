@@ -16,6 +16,7 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
+const path = require('path');
 
 // Local mock store (used when USE_AWS=false)
 const mockStore = require('../data/mockStore');
@@ -89,7 +90,7 @@ router.get('/:id', async (req, res) => {
 //     "lng": -74.0060,
 //     "label": "Camera Zone A"
 //   },
-//   "evidenceUrl": "/sample-evidence/sample1.jpg"
+//   "evidenceUrl": "/sample-evidence/sample1.svg"
 // }
 // ─────────────────────────────────────────────
 router.post('/', async (req, res) => {
@@ -121,11 +122,32 @@ router.post('/', async (req, res) => {
     };
 
     if (USE_AWS) {
-      // Save to DynamoDB
+      // ── S3: upload simulated evidence and replace evidenceUrl ──────────────
+      // The evidenceUrl arriving from the frontend is a local path like
+      // "/sample-evidence/sample1.svg". When USE_AWS=true we upload that SVG
+      // file to S3 and store a presigned URL in DynamoDB instead, so the
+      // evidence is genuinely held in S3.
+      //
+      // NOTE: This uploads SIMULATED / PROTOTYPE evidence only.
+      // These are pre-made SVG graphics, not real camera captures.
+      if (newIncident.evidenceUrl) {
+        // Extract just the filename from the local path (e.g. "sample1.svg")
+        const evidenceFilename = path.basename(newIncident.evidenceUrl);
+        const { s3Key, presignedUrl } = await s3Service.uploadEvidenceFromPath(
+          evidenceFilename,
+          newIncident.id
+        );
+        // Overwrite the local path with the real S3 presigned URL
+        newIncident.evidenceUrl = presignedUrl;
+        newIncident.evidenceS3Key = s3Key; // store key separately for reference
+        console.log(`[S3] Evidence stored at key: ${s3Key}`);
+      }
+
+      // ── DynamoDB: save incident (evidenceUrl now points to S3) ─────────────
       await dynamoService.addIncident(newIncident);
-      // Trigger SNS alert notification
+
+      // ── SNS: publish alert notification ────────────────────────────────────
       await snsService.publishAlert(newIncident);
-      // (S3 evidence upload would happen here with real camera data)
     } else {
       mockStore.addIncident(newIncident);
     }
