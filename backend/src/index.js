@@ -24,7 +24,12 @@ const PORT = process.env.PORT || 3001;
 
 // --- Middleware ---
 // cors() allows the frontend (running on port 5173) to talk to this backend
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'https://sentinelgrid-ai2.pages.dev'
+  ]
+}));
 // express.json() lets us read JSON data sent in request bodies
 app.use(express.json());
 
@@ -43,7 +48,7 @@ app.get('/health', (req, res) => {
 });
 
 // --- Start Server ---
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('🟢 SentinelGrid Backend is running');
   console.log(`   URL:  http://localhost:${PORT}`);
