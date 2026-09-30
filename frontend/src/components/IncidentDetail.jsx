@@ -44,7 +44,7 @@ export default function IncidentDetail({ incident, onIncidentUpdated }) {
     setVerifying(true);
     setActionError(null);
     try {
-      const response = await fetch(`/incidents/${incident.id}/verify`, {
+      const response = await fetch(`https://sentinelgrid-2l30.onrender.com/incidents/${incident.id}/verify`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, operatorName: 'Operator 1' }),
