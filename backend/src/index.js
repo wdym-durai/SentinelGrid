@@ -8,13 +8,24 @@
  * AWS integration (DynamoDB, S3, SNS) will be connected later
  * by setting USE_AWS=true in the .env file.
  *
- * Middleware order is intentional:
- *   1. POST /ring/webhook  — express.raw() BEFORE express.json()
- *      The webhook handler requires the raw request body Buffer for
- *      HMAC-SHA256 signature verification. If express.json() runs first
- *      the raw bytes are consumed and verification becomes impossible.
- *   2. express.json()      — global JSON parsing for all other routes
- *   3. All other routes
+ * Middleware registration order is intentional — do not reorder:
+ *
+ *   1. POST /ring/webhook  — express.raw({ type:'application/json' })
+ *      Must be registered BEFORE express.json(). The webhook handler
+ *      requires the raw request body Buffer for HMAC-SHA256 signature
+ *      verification. If express.json() runs first the raw bytes are
+ *      consumed and HMAC verification becomes impossible.
+ *
+ *   2. express.urlencoded({ extended: false })
+ *      Ring's Token Exchange URL receives an application/x-www-form-urlencoded
+ *      POST from Ring's backend. This parser makes req.body.code available
+ *      on that route. Safe alongside express.json() — each parser only
+ *      activates for its own Content-Type.
+ *
+ *   3. express.json()
+ *      Global JSON body parsing for all other routes.
+ *
+ *   4. All other routes.
  */
 
 // Load environment variables from .env file (if it exists).
@@ -41,24 +52,37 @@ app.use(cors({
 }));
 
 // ── Step 1: Ring webhook — express.raw() BEFORE express.json() ───────────────
-//
-// This route MUST be registered before app.use(express.json()) below.
-// express.raw({ type: 'application/json' }) captures the raw body as a Buffer
-// without parsing it, making it available as req.body in ringWebhookHandler
-// for HMAC-SHA256 signature verification.
-//
-// All other routes receive normal JSON parsing via express.json() below.
-app.post('/ring/webhook', express.raw({ type: 'application/json' }), ringWebhookHandler);
+// express.raw() captures the body as a Buffer without parsing it.
+// ringWebhookHandler uses this raw Buffer for HMAC-SHA256 verification.
+app.post(
+  '/ring/webhook',
+  express.raw({ type: 'application/json' }),
+  ringWebhookHandler,
+);
 
-// ── Step 2: Global JSON parsing for all remaining routes ─────────────────────
+// ── Step 2: Form-encoded body parser ─────────────────────────────────────────
+// Ring's backend POSTs the authorization code to our Token Exchange URL
+// as application/x-www-form-urlencoded. This parser makes req.body.code
+// available in POST /ring/token-exchange.
+// extended:false uses the built-in querystring module (no extra dependencies).
+app.use(express.urlencoded({ extended: false }));
+
+// ── Step 3: Global JSON parsing ───────────────────────────────────────────────
 app.use(express.json());
 
-// ── Step 3: Routes ────────────────────────────────────────────────────────────
-app.use('/ring',      ringRouter);       // GET /ring/status, /account-link, /callback
+// ── Step 4: Routes ────────────────────────────────────────────────────────────
+//
+// Ring Developer Console URL mapping:
+//   Token Exchange URL → POST /ring/token-exchange  (handled by ringRouter)
+//   Account Link URL   → GET  /ring/account-link    (handled by ringRouter)
+//   Webhook URL        → POST /ring/webhook         (handled above with raw body)
+//   App Homepage URL   → GET  /ring/home            (handled by ringRouter)
+//
+app.use('/ring',      ringRouter);       // all /ring/* routes except /webhook
 app.use('/incidents', incidentRoutes);   // existing incident CRUD — unchanged
 
-// ── Health check ─────────────────────────────────────────────────────────────
-// Visit http://localhost:3001/health to confirm the server is running
+// ── Health check ──────────────────────────────────────────────────────────────
+// GET http://localhost:3001/health — confirms server is running
 app.get('/health', (req, res) => {
   res.json({
     status:    'ok',

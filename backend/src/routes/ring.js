@@ -1,58 +1,71 @@
 /**
  * SentinelGrid — Ring Developer API Routes
  *
- * Implements the Partner-Initiated OAuth 2.0 account linking flow.
- * Does NOT implement the one-way / Ring-driven (HMAC nonce) flow.
+ * Implements the one-way (Ring-driven) account linking flow required by the
+ * Ring Developer Console. This is the standard flow for all Ring AppStore apps.
+ *
+ * Also retains the Partner-Initiated OAuth 2.0 callback endpoint (invitation-only).
  *
  * Official Ring Developer API documentation used as source of truth:
  *   https://developer.amazon.com/docs/ring/api-documentation.html
+ *   https://developer.amazon.com/docs/ring/developer-faq.html
  *
  * Security rules enforced throughout:
  *   - All Ring credentials read from environment variables only
  *   - Access tokens, refresh tokens, client secrets never returned in responses
  *   - All Ring OAuth calls are server-to-server (Ring CORS blocks browser calls)
- *   - HMAC webhook signatures verified before any payload is processed
+ *   - HMAC-SHA256 webhook signatures verified before any payload is processed
  *   - Webhook idempotency via meta.request_id prevents duplicate incidents
+ *   - Nonce matching uses constant-time comparison to prevent timing attacks
  *
- * Endpoints in this module:
- *   GET  /ring/status         — safe config/status only, no secrets
- *   GET  /ring/account-link   — start Partner-Initiated OAuth 2.0 (PKCE S256)
- *   GET  /ring/callback       — receive Ring redirect, validate state, exchange code
- *   POST /ring/webhook        — handler exported separately for express.raw() wiring
+ * Ring Developer Console URL mapping:
+ *
+ *   Console field         Our endpoint
+ *   ─────────────────     ─────────────────────────────
+ *   Token Exchange URL  → POST /ring/token-exchange
+ *   Account Link URL    → GET  /ring/account-link
+ *   Webhook URL         → POST /ring/webhook
+ *   App Homepage URL    → GET  /ring/home
+ *
+ * Additional endpoints:
+ *   GET  /ring/status     — safe config/status, no secrets
+ *   GET  /ring/callback   — Partner-Initiated OAuth 2.0 (invitation-only)
  *
  * Ring OAuth endpoints confirmed from official docs:
- *   Authorization : https://account.ring.com/account/integrations/partner-link/authorize
- *   Token exchange: https://oauth.ring.com/oauth/token
- *   Vision API    : https://api.amazonvision.com
- *   Webhook header: X-Signature: sha256=<hmac_hex>
+ *   Token exchange : https://oauth.ring.com/oauth/token
+ *   Vision API     : https://api.amazonvision.com
+ *   Webhook header : X-Signature: sha256=<hmac_hex>
+ *   Nonce algorithm: HMAC-SHA256(K_hmac, "<time_ms>:<account_id>"), Base64URL no padding
  */
 
 'use strict';
 
 const express = require('express');
-const crypto  = require('crypto');  // built-in Node.js — no extra package needed
+const crypto  = require('crypto');  // built-in Node.js
 const { v4: uuidv4 } = require('uuid');
 
 const router     = express.Router();
 const tokenStore = require('../services/ringTokenStore');
 const mockStore  = require('../data/mockStore');
 
-// ── Ring credentials — from environment variables only, never hardcoded ──────
+// ── Ring credentials — environment variables only, never hardcoded ───────────
 const RING_CLIENT_ID          = process.env.RING_CLIENT_ID;
 const RING_CLIENT_SECRET      = process.env.RING_CLIENT_SECRET;
 const RING_HMAC_SIGNATURE_KEY = process.env.RING_HMAC_SIGNATURE_KEY;
 const RING_REDIRECT_URI       = process.env.RING_REDIRECT_URI;
 const RING_API_BASE_URL       = process.env.RING_API_BASE_URL
                                   || 'https://api.amazonvision.com';
+const RING_APP_HOMEPAGE_URL   = process.env.RING_APP_HOMEPAGE_URL
+                                  || 'http://localhost:5173';
 
-// Ring OAuth server URLs — confirmed from official docs
+// Ring OAuth server URL — confirmed from official docs
+const RING_TOKEN_URL = 'https://oauth.ring.com/oauth/token';
+
+// Ring authorization URL — used by Partner-Initiated flow only
 const RING_AUTHORIZE_URL = 'https://account.ring.com/account/integrations/partner-link/authorize';
-const RING_TOKEN_URL     = 'https://oauth.ring.com/oauth/token';
 
-// ── PKCE session store ────────────────────────────────────────────────────────
+// ── PKCE session store — for Partner-Initiated flow only ─────────────────────
 // Maps state token → { codeVerifier, createdAt }
-// TTL: 10 minutes. Ring's authorization codes expire within 10 minutes too.
-// In production replace with a short-TTL encrypted session store (e.g. Redis).
 const pkceSessionStore = new Map();
 const PKCE_TTL_MS = 10 * 60 * 1000;
 
@@ -64,27 +77,22 @@ function cleanExpiredPkceSessions() {
 }
 
 // ── Webhook idempotency store ─────────────────────────────────────────────────
-// Tracks processed meta.request_id values so Ring webhook retries cannot
-// create duplicate incidents. Bounded at 1000 entries to limit memory use.
+// Tracks processed meta.request_id values. Bounded at 1000 entries.
 const processedWebhookIds = new Set();
 const MAX_PROCESSED_IDS = 1000;
 
 function markWebhookProcessed(requestId) {
   if (processedWebhookIds.size >= MAX_PROCESSED_IDS) {
-    // Remove the oldest entry — Sets preserve insertion order
     processedWebhookIds.delete(processedWebhookIds.values().next().value);
   }
   processedWebhookIds.add(requestId);
 }
 
-// ── Config check helper ───────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function getMissingVarNames(varMap) {
-  return Object.entries(varMap)
-    .filter(([, v]) => !v)
-    .map(([k]) => k);
+  return Object.entries(varMap).filter(([, v]) => !v).map(([k]) => k);
 }
 
-// ── HTML escape — used only in callback HTML responses, never for JSON ────────
 function escapeHtml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -97,8 +105,7 @@ function escapeHtml(str) {
 // GET /ring/status
 //
 // Returns safe integration status only.
-// Shows which env vars are present (boolean only — not their values)
-// and a safe summary of linked accounts (no tokens, no secrets).
+// Shows which env vars are present (boolean) and account summary (no tokens).
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/status', (req, res) => {
   const varPresence = {
@@ -107,6 +114,7 @@ router.get('/status', (req, res) => {
     RING_HMAC_SIGNATURE_KEY: !!RING_HMAC_SIGNATURE_KEY,
     RING_REDIRECT_URI:       !!RING_REDIRECT_URI,
     RING_API_BASE_URL:       !!RING_API_BASE_URL,
+    RING_APP_HOMEPAGE_URL:   !!RING_APP_HOMEPAGE_URL,
   };
   const allConfigured = Object.values(varPresence).every(Boolean);
 
@@ -114,48 +122,475 @@ router.get('/status', (req, res) => {
     success: true,
     ring: {
       integrationReady:    allConfigured,
-      configuredVariables: varPresence,       // booleans only — no values exposed
-      ...tokenStore.getStatusSummary(),       // account count + safe per-account info
+      configuredVariables: varPresence,
+      ...tokenStore.getStatusSummary(),
     },
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /ring/home
+//
+// App Homepage URL — registered in the Ring Developer Console.
+// Ring directs users here after account linking is complete.
+// Redirects to the SentinelGrid dashboard.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/home', (req, res) => {
+  res.redirect(RING_APP_HOMEPAGE_URL);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /ring/token-exchange
+//
+// Token Exchange URL — registered in the Ring Developer Console.
+// Ring calls this endpoint server-to-server (NOT via the user's browser)
+// immediately after a user approves the app in the Ring AppStore.
+//
+// Ring POSTs an authorization code as an application/x-www-form-urlencoded
+// body. We must:
+//   1. Extract the authorization code from the request body
+//   2. Exchange it at https://oauth.ring.com/oauth/token within 60 seconds
+//      Parameters: grant_type=authorization_code, code, client_id, client_secret
+//      NOTE: No PKCE (code_verifier) — one-way flow does not use PKCE
+//   3. Call GET /v1/users/me to retrieve the Ring Account ID (data.id)
+//   4. Store tokens as UNCLAIMED — they are not yet associated with a partner user
+//   5. Return HTTP 200 promptly
+//
+// Source: https://developer.amazon.com/docs/ring/api-documentation.html
+//         Section 5 — Token Exchange Flow
+//         https://developer.amazon.com/docs/ring/developer-faq.html Q1
+//
+// IMPORTANT: The request body from Ring may be either form-encoded or JSON
+// depending on Ring's implementation. We handle both formats.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/token-exchange', async (req, res) => {
+  const missing = getMissingVarNames({ RING_CLIENT_ID, RING_CLIENT_SECRET });
+  if (missing.length) {
+    console.error('[Ring] Token Exchange: missing env vars:', missing);
+    // Still return 200 — returning an error could cause Ring to retry
+    return res.status(200).json({
+      success: false,
+      error:   'Token Exchange endpoint not fully configured',
+    });
+  }
+
+  // Ring sends the authorization code — body may be form-encoded or JSON
+  const code = req.body?.code || req.query?.code;
+  if (!code) {
+    console.warn('[Ring] Token Exchange: no authorization code in request');
+    return res.status(200).json({ success: false, error: 'Missing authorization code' });
+  }
+
+  console.log('[Ring] Token Exchange: received authorization code, exchanging...');
+
+  // ── Exchange authorization code for tokens (server-to-server) ────────────
+  // Authorization codes expire in 60 seconds — exchange immediately.
+  // One-way flow does NOT use PKCE; no code_verifier parameter.
+  // Source: Ring docs Section 5, confirmed from FAQ Q1.
+  let tokens;
+  try {
+    const tokenBody = new URLSearchParams({
+      grant_type:    'authorization_code',
+      code,
+      client_id:     RING_CLIENT_ID,
+      client_secret: RING_CLIENT_SECRET,
+    });
+
+    const tokenRes = await fetch(RING_TOKEN_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    tokenBody.toString(),
+    });
+
+    if (!tokenRes.ok) {
+      const errText = await tokenRes.text();
+      console.error(`[Ring] Token exchange failed (${tokenRes.status}): ${errText}`);
+      return res.status(200).json({
+        success: false,
+        error:   `Token exchange failed with status ${tokenRes.status}`,
+      });
+    }
+
+    tokens = await tokenRes.json();
+  } catch (networkErr) {
+    console.error('[Ring] Network error during token exchange:', networkErr.message);
+    return res.status(200).json({
+      success: false,
+      error:   'Network error reaching Ring token endpoint',
+    });
+  }
+
+  // ── Retrieve Ring Account ID via GET /v1/users/me ─────────────────────────
+  // The Account ID (data.id) keys the token store and is used to compute
+  // nonces during account linking.
+  // Response structure: { "data": { "id": "ava1.ring.account.XXXYYY", ... } }
+  let accountId = `unknown-${uuidv4()}`;
+  try {
+    const profileRes = await fetch(`${RING_API_BASE_URL}/v1/users/me`, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    if (profileRes.ok) {
+      const profile = await profileRes.json();
+      accountId = profile?.data?.id || accountId;
+    } else {
+      console.warn(`[Ring] /v1/users/me returned ${profileRes.status} — using generated ID`);
+    }
+  } catch (profileErr) {
+    console.warn('[Ring] Could not fetch user profile:', profileErr.message);
+  }
+
+  // ── Store tokens as UNCLAIMED ─────────────────────────────────────────────
+  // Tokens are now held server-side but not yet associated with a partner user.
+  // The nonce matching step at GET /ring/account-link will claim them.
+  tokenStore.saveUnclaimedTokens(
+    accountId,
+    tokens.access_token,
+    tokens.refresh_token,
+    tokens.expires_in || 14400,
+  );
+
+  console.log(`[Ring] Token Exchange complete — accountId: ${accountId} (UNCLAIMED)`);
+
+  // Return 200 — Ring requires this to confirm receipt
+  res.status(200).json({ success: true, accountId });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /ring/account-link
 //
-// Entry point for Partner-Initiated OAuth 2.0.
-// Generates a PKCE pair (code_verifier + code_challenge S256) and a CSRF
-// state token, stores them, then redirects the user's browser to Ring's
-// authorization page.
+// Account Link URL — registered in the Ring Developer Console.
+// Ring redirects the user's browser here AFTER the Token Exchange completes,
+// with query parameters: ?nonce=<hmac_nonce>&time=<unix_ms>
 //
-// After the user authenticates and approves device access, Ring redirects
-// to RING_REDIRECT_URI (GET /ring/callback).
+// This endpoint must:
+//   1. Extract nonce and time from query params
+//   2. Validate freshness: time must be within 600 seconds of now
+//      (time param is Unix epoch in MILLISECONDS)
+//   3. Present a login/confirmation page to the user (sign-in is mandatory)
+//   4. After user confirms, perform nonce matching:
+//      For each UNCLAIMED token, compute:
+//        HMAC-SHA256(K_hmac, "<time_ms>:<account_id>")
+//        encoded as Base64URL without padding (not hex — different from webhooks)
+//      Find the token whose computed nonce matches the received nonce (constant-time)
+//   5. Call POST /v1/accounts/me/app-integrations with { account_identifier, nonce }
+//   6. Call PATCH /v1/accounts/me/app-integrations with { status: "completed" }
+//   7. Mark the token as CLAIMED in the token store
 //
-// Authorization URL parameters — confirmed from official Ring docs:
+// Nonce algorithm confirmed from official Ring docs Section 6.3 and FAQ Q2:
+//   payload  = "<time_ms>:<account_id>"   (time in milliseconds as-is)
+//   mac      = HMAC-SHA256(K_hmac.encode('utf-8'), payload.encode('utf-8'))
+//   nonce    = Base64URL(mac) without padding  (NOT hex — webhooks use hex)
+//   window   = 600 seconds
+//
+// Source: https://developer.amazon.com/docs/ring/api-documentation.html
+//         Section 6.3 — Nonce Validation and Account Linking
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/account-link', (req, res) => {
+  const { nonce, time } = req.query;
+
+  // ── No nonce/time params — Partner-Initiated entry point ──────────────────
+  // If the user arrives at this URL directly without Ring's params (e.g. from
+  // the SentinelGrid dashboard "Connect Ring" button), initiate Partner-Initiated
+  // flow if configured, otherwise show an informational page.
+  if (!nonce || !time) {
+    const missing = getMissingVarNames({ RING_CLIENT_ID, RING_REDIRECT_URI });
+    if (!missing.length) {
+      // Redirect to Partner-Initiated flow
+      return res.redirect('/ring/partner-link');
+    }
+    return res.status(200).send(`
+      <html><head><title>SentinelGrid — Ring Account Link</title></head>
+      <body style="font-family:sans-serif;max-width:480px;margin:40px auto;padding:20px">
+        <h2>🛡️ SentinelGrid — Ring Integration</h2>
+        <p>This page handles Ring account linking.</p>
+        <p>To link your Ring account, install the SentinelGrid app from the Ring AppStore.
+        Ring will redirect you here automatically.</p>
+        <p><a href="/">Return to SentinelGrid Dashboard</a></p>
+      </body></html>`);
+  }
+
+  // ── Step 1: Validate nonce and time are present ───────────────────────────
+  const missing = getMissingVarNames({ RING_HMAC_SIGNATURE_KEY });
+  if (missing.length) {
+    console.error('[Ring] Account Link: RING_HMAC_SIGNATURE_KEY not set');
+    return res.status(503).send(
+      '<html><body><h2>Account linking is not configured on this server.</h2></body></html>',
+    );
+  }
+
+  // ── Step 2: Freshness check ───────────────────────────────────────────────
+  // time is Unix epoch in MILLISECONDS — confirmed from Ring docs FAQ Q2
+  const VALIDATION_WINDOW_MS = 600 * 1000; // 600 seconds in ms
+  const timeMsParam = parseInt(time, 10);
+  if (isNaN(timeMsParam)) {
+    console.warn('[Ring] Account Link: invalid time parameter');
+    return res.status(400).send('<html><body><h2>Invalid time parameter.</h2></body></html>');
+  }
+
+  const ageSec = (Date.now() - timeMsParam) / 1000;
+  if (ageSec > 600) {
+    console.warn(`[Ring] Account Link: nonce expired (${Math.round(ageSec)}s old)`);
+    return res.status(400).send(`
+      <html><body>
+        <h2>Link request expired.</h2>
+        <p>This link is ${Math.round(ageSec)} seconds old. Please return to Ring and try again.</p>
+      </body></html>`);
+  }
+  if (ageSec < 0) {
+    console.warn('[Ring] Account Link: timestamp is in the future — rejected');
+    return res.status(400).send('<html><body><h2>Invalid timestamp.</h2></body></html>');
+  }
+
+  // ── Step 3: Show confirmation page with POST action ───────────────────────
+  // Ring's certification requires the user to explicitly authenticate or confirm.
+  // For this prototype we present a minimal confirmation form.
+  // The nonce and time are passed forward as hidden form fields so the POST
+  // handler can complete the nonce matching.
+  // NOTE: In production, this page would show a full login form.
+  res.send(`
+    <html>
+      <head><title>SentinelGrid — Connect Ring Account</title></head>
+      <body style="font-family:sans-serif;max-width:480px;margin:40px auto;padding:20px">
+        <h2>🛡️ Connect Ring Account to SentinelGrid</h2>
+        <p>A Ring account is ready to be linked to SentinelGrid.</p>
+        <p>By confirming, you allow SentinelGrid to receive motion alerts
+           from your Ring devices for the monitoring dashboard.</p>
+        <hr>
+        <p style="font-size:0.85em;color:#555">
+          ⚠️ SentinelGrid is a prototype monitoring tool. Events flagged by Ring
+          devices require human verification. No automatic action will be taken.
+        </p>
+        <form method="POST" action="/ring/account-link/confirm">
+          <input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+          <input type="hidden" name="time"  value="${escapeHtml(time)}">
+          <button type="submit"
+            style="background:#2563eb;color:white;border:none;padding:12px 24px;
+                   border-radius:6px;font-size:1em;cursor:pointer;margin-top:12px">
+            ✅ Confirm — Link My Ring Account
+          </button>
+        </form>
+        <p style="margin-top:16px"><a href="/">Cancel — Return to Dashboard</a></p>
+      </body>
+    </html>`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /ring/account-link/confirm
+//
+// Handles the confirmation form submission from GET /ring/account-link.
+// Performs nonce matching against unclaimed tokens, then calls the
+// App-Integrations API to finalise the account link.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/account-link/confirm', async (req, res) => {
+  const { nonce: receivedNonce, time } = req.body;
+
+  if (!receivedNonce || !time) {
+    return res.status(400).send('<html><body><h2>Missing nonce or time parameter.</h2></body></html>');
+  }
+
+  if (!RING_HMAC_SIGNATURE_KEY) {
+    return res.status(503).send('<html><body><h2>Server not configured for nonce matching.</h2></body></html>');
+  }
+
+  const timeMsParam = parseInt(time, 10);
+
+  // Re-validate freshness — form submission could be delayed
+  const ageSec = (Date.now() - timeMsParam) / 1000;
+  if (ageSec > 600 || ageSec < 0) {
+    return res.status(400).send(`
+      <html><body>
+        <h2>Link request expired. Please return to Ring and try again.</h2>
+      </body></html>`);
+  }
+
+  // ── Step 4: Nonce matching ────────────────────────────────────────────────
+  // Iterate through all UNCLAIMED tokens.
+  // For each, compute: HMAC-SHA256(K_hmac, "<time_ms>:<account_id>")
+  // Encode as Base64URL without padding.
+  // Compare with constant-time comparison.
+  //
+  // Algorithm confirmed from Ring docs Section 6.3 and FAQ Q2:
+  //   - time param is milliseconds (use as-is in the HMAC payload string)
+  //   - encoding is URL-safe Base64 WITHOUT padding (NOT hex)
+  //   - the same K_hmac key is used for webhooks but webhooks use hex encoding
+  const unclaimedTokens = tokenStore.getUnclaimedTokens();
+
+  if (unclaimedTokens.length === 0) {
+    console.warn('[Ring] Nonce match: no unclaimed tokens in pool');
+    return res.status(400).send(`
+      <html><body>
+        <h2>No pending Ring accounts to link.</h2>
+        <p>The account may have already been linked or the session expired.</p>
+        <p><a href="/">Return to Dashboard</a></p>
+      </body></html>`);
+  }
+
+  let matchedToken = null;
+  for (const record of unclaimedTokens) {
+    const payload      = `${time}:${record.accountId}`;
+    const computedMac  = crypto
+      .createHmac('sha256', RING_HMAC_SIGNATURE_KEY)
+      .update(payload, 'utf8')
+      .digest();
+    // Base64URL without padding — confirmed from Ring docs FAQ Q2
+    const computedNonce = computedMac
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    // Constant-time comparison prevents timing attacks
+    let match = false;
+    try {
+      match = crypto.timingSafeEqual(
+        Buffer.from(computedNonce, 'utf8'),
+        Buffer.from(receivedNonce,  'utf8'),
+      );
+    } catch {
+      // Buffer lengths differ — not a match
+      match = false;
+    }
+
+    if (match) {
+      matchedToken = record;
+      break;
+    }
+  }
+
+  if (!matchedToken) {
+    console.warn('[Ring] Nonce match: no matching unclaimed token found');
+    return res.status(400).send(`
+      <html><body>
+        <h2>Account linking failed — nonce did not match.</h2>
+        <p>Please return to Ring and try again.</p>
+        <p><a href="/">Return to Dashboard</a></p>
+      </body></html>`);
+  }
+
+  console.log(`[Ring] Nonce matched — accountId: ${matchedToken.accountId}`);
+
+  // Prototype account identifier — obfuscated partner-side user identifier.
+  // In production this would be the masked email of the authenticated partner user.
+  // Ring certification requires this to be a non-empty string.
+  const PROTOTYPE_ACCOUNT_IDENTIFIER = 'sentinelgrid-operator@prototype.local';
+
+  // ── Step 5: POST to App-Integrations API ─────────────────────────────────
+  // Sends the nonce back to Ring for server-side verification.
+  // Transitions integration to 'awaiting' status.
+  try {
+    const postRes = await fetch(
+      `${RING_API_BASE_URL}/v1/accounts/me/app-integrations`,
+      {
+        method:  'POST',
+        headers: {
+          Authorization:  `Bearer ${matchedToken.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          account_identifier: PROTOTYPE_ACCOUNT_IDENTIFIER,
+          nonce:              receivedNonce,
+        }),
+      },
+    );
+
+    if (!postRes.ok) {
+      const errText = await postRes.text();
+      console.error(`[Ring] App-Integrations POST failed (${postRes.status}): ${errText}`);
+      return res.status(502).send(`
+        <html><body>
+          <h2>Ring verification failed (${postRes.status}).</h2>
+          <p>Please try again.</p>
+        </body></html>`);
+    }
+
+    console.log(`[Ring] App-Integrations POST accepted for account: ${matchedToken.accountId}`);
+  } catch (networkErr) {
+    console.error('[Ring] Network error during App-Integrations POST:', networkErr.message);
+    return res.status(502).send(
+      '<html><body><h2>Network error contacting Ring. Please try again.</h2></body></html>',
+    );
+  }
+
+  // ── Step 6: PATCH to complete the integration ─────────────────────────────
+  // Transitions integration from 'awaiting' to 'completed'.
+  // After this, webhook events will be delivered and device API is active.
+  try {
+    const patchRes = await fetch(
+      `${RING_API_BASE_URL}/v1/accounts/me/app-integrations`,
+      {
+        method:  'PATCH',
+        headers: {
+          Authorization:  `Bearer ${matchedToken.accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ status: 'completed' }),
+      },
+    );
+
+    if (patchRes.ok) {
+      console.log(`[Ring] Integration PATCH completed for account: ${matchedToken.accountId}`);
+    } else {
+      const patchErr = await patchRes.text();
+      // Log but continue — token is already claimed, PATCH can be retried
+      console.warn(`[Ring] Integration PATCH returned ${patchRes.status}: ${patchErr}`);
+    }
+  } catch (patchErr) {
+    console.warn('[Ring] Network error during PATCH:', patchErr.message);
+  }
+
+  // ── Step 7: Mark token as CLAIMED ────────────────────────────────────────
+  tokenStore.claimToken(matchedToken.accountId, PROTOTYPE_ACCOUNT_IDENTIFIER);
+
+  console.log(`[Ring] Account linking complete — accountId: ${matchedToken.accountId}`);
+
+  // Return safe confirmation — no tokens in response
+  res.send(`
+    <html>
+      <head><title>SentinelGrid — Ring Linked</title></head>
+      <body style="font-family:sans-serif;max-width:480px;margin:40px auto;padding:20px">
+        <h2>✅ Ring Account Linked Successfully</h2>
+        <p>Your Ring devices are now connected to SentinelGrid.</p>
+        <p>Motion events detected by your Ring devices will appear on the
+           SentinelGrid dashboard for human verification.</p>
+        <p><strong>Account ID:</strong> ${escapeHtml(matchedToken.accountId)}</p>
+        <hr>
+        <p style="font-size:0.8em;color:#666">
+          PROTOTYPE: account_identifier is a static placeholder.<br>
+          Events flagged by Ring devices require human operator verification.
+          No automatic action is taken.
+        </p>
+        <p><a href="${escapeHtml(RING_APP_HOMEPAGE_URL)}">Open SentinelGrid Dashboard →</a></p>
+      </body>
+    </html>`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ring/partner-link
+//
+// Entry point for Partner-Initiated OAuth 2.0 (invitation-only).
+// Generates a PKCE pair + CSRF state token, redirects to Ring's authorization
+// page. Only available if RING_CLIENT_ID and RING_REDIRECT_URI are set.
+//
+// Authorization URL parameters confirmed from official Ring docs:
 //   client_id, redirect_uri, response_type=code, scope=ava.v1:read,
 //   state, code_challenge, code_challenge_method=S256
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/account-link', (req, res) => {
+router.get('/partner-link', (req, res) => {
   const missing = getMissingVarNames({ RING_CLIENT_ID, RING_REDIRECT_URI });
   if (missing.length) {
     return res.status(503).json({
       success: false,
-      error:   'Ring integration not fully configured.',
+      error:   'Partner-Initiated flow not configured.',
       missing,
-      hint:    'Set the missing variables in your .env file.',
+      hint:    'This flow is invitation-only. Set RING_CLIENT_ID and RING_REDIRECT_URI.',
     });
   }
 
-  // PKCE code_verifier: cryptographically random, URL-safe base64, 43–128 chars
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
-
-  // code_challenge = Base64URL( SHA-256( code_verifier ) )  — method S256
   const codeChallenge = crypto
     .createHash('sha256')
     .update(codeVerifier, 'ascii')
     .digest('base64url');
-
-  // CSRF state: opaque random string stored server-side for callback validation
   const state = crypto.randomBytes(16).toString('base64url');
 
   cleanExpiredPkceSessions();
@@ -171,41 +606,25 @@ router.get('/account-link', (req, res) => {
     code_challenge_method: 'S256',
   });
 
-  const authUrl = `${RING_AUTHORIZE_URL}?${params.toString()}`;
-  console.log(`[Ring] Starting account-link — state: ${state}`);
-  res.redirect(authUrl);
+  console.log(`[Ring] Starting Partner-Initiated link — state: ${state}`);
+  res.redirect(`${RING_AUTHORIZE_URL}?${params.toString()}`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /ring/callback
 //
-// RING_REDIRECT_URI must point to this endpoint exactly as registered in the
-// Ring Developer Portal.
+// Partner-Initiated OAuth 2.0 callback (invitation-only).
+// RING_REDIRECT_URI must point here. Ring redirects after user approves.
 //
-// Ring redirects here after the user approves access:
-//   Success: GET /ring/callback?code=<auth_code>&state=<state>
-//   Error:   GET /ring/callback?error=<code>&error_description=<desc>&state=<state>
+// Steps: validate state → consume PKCE session → exchange code (no PKCE) →
+//        get Account ID → store tokens (CLAIMED) → PATCH app-integrations →
+//        show confirmation.
 //
-// Steps performed:
-//   1. Detect and handle Ring-side errors
-//   2. Validate state against PKCE session (CSRF protection)
-//   3. Consume PKCE session (one-time use)
-//   4. POST to https://oauth.ring.com/oauth/token — server-to-server
-//      Parameters: grant_type, code, code_verifier, client_id, client_secret
-//      NOTE: redirect_uri is NOT included — not listed in Ring's documented
-//            token exchange parameters (confirmed from official docs, Step 4)
-//   5. GET /v1/users/me to retrieve Ring Account ID (data.id)
-//   6. Store tokens server-side via ringTokenStore — never returned to caller
-//   7. PATCH /v1/accounts/me/app-integrations with status:"completed"
-//      Required to activate device consents and enable webhook delivery
-//      Per docs: "The integration is not fully active until you call this
-//      endpoint with status: 'completed'."
-//   8. Return a safe HTML confirmation page — no tokens anywhere in response
+// NOTE: redirect_uri is NOT included in the token exchange body per Ring docs.
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/callback', async (req, res) => {
   const { code, state, error, error_description } = req.query;
 
-  // ── Step 1: Handle Ring-side errors ────────────────────────────────────────
   if (error) {
     console.warn(`[Ring] Callback error: ${error} — ${error_description}`);
     return res.status(400).send(`
@@ -218,46 +637,32 @@ router.get('/callback', async (req, res) => {
       </body></html>`);
   }
 
-  // ── Validate required parameters ───────────────────────────────────────────
   if (!code || !state) {
-    console.warn('[Ring] Callback missing code or state');
     return res.status(400).send(
-      '<html><body><h2>Invalid callback — missing required parameters.</h2></body></html>',
+      '<html><body><h2>Invalid callback — missing parameters.</h2></body></html>',
     );
   }
 
-  // ── Step 2–3: Validate and consume PKCE session ────────────────────────────
   cleanExpiredPkceSessions();
   const pkceSession = pkceSessionStore.get(state);
   if (!pkceSession) {
-    console.warn('[Ring] Callback rejected — state not found or expired');
+    console.warn('[Ring] Callback: state not found or expired');
     return res.status(400).send(`
       <html><body>
-        <h2>Session expired or invalid state.</h2>
-        <p>Please <a href="/ring/account-link">restart account linking</a>.</p>
+        <h2>Session expired.</h2>
+        <p><a href="/ring/partner-link">Restart account linking</a></p>
       </body></html>`);
   }
-  // Consume immediately — each state/code pair is one-time use
   pkceSessionStore.delete(state);
   const { codeVerifier } = pkceSession;
 
-  // ── Check required credentials are present ─────────────────────────────────
   const missing = getMissingVarNames({ RING_CLIENT_ID, RING_CLIENT_SECRET });
   if (missing.length) {
-    console.error('[Ring] Cannot exchange token — missing env vars:', missing);
     return res.status(503).send(
       `<html><body><h2>Server configuration error. Missing: ${missing.join(', ')}</h2></body></html>`,
     );
   }
 
-  // ── Step 4: Exchange authorization code for tokens (server-to-server) ──────
-  // Ring's CORS policy blocks browser-initiated calls to oauth.ring.com.
-  // This MUST be a backend call. Node 24 has built-in fetch.
-  //
-  // CORRECTION: redirect_uri is NOT included in the request body.
-  // Ring's documented token exchange parameters (Step 4) list exactly:
-  //   grant_type, code, code_verifier, client_id, client_secret
-  // Source: https://developer.amazon.com/docs/ring/api-documentation.html
   let tokens;
   try {
     const tokenBody = new URLSearchParams({
@@ -276,24 +681,20 @@ router.get('/callback', async (req, res) => {
 
     if (!tokenRes.ok) {
       const errText = await tokenRes.text();
-      console.error(`[Ring] Token exchange failed (${tokenRes.status}): ${errText}`);
+      console.error(`[Ring] Callback token exchange failed (${tokenRes.status}): ${errText}`);
       return res.status(502).send(
-        `<html><body><h2>Token exchange with Ring failed (${tokenRes.status}).</h2></body></html>`,
+        `<html><body><h2>Token exchange failed (${tokenRes.status}).</h2></body></html>`,
       );
     }
 
     tokens = await tokenRes.json();
   } catch (networkErr) {
-    console.error('[Ring] Network error during token exchange:', networkErr.message);
+    console.error('[Ring] Callback network error:', networkErr.message);
     return res.status(502).send(
-      '<html><body><h2>Could not reach Ring token endpoint. Check network connectivity.</h2></body></html>',
+      '<html><body><h2>Could not reach Ring token endpoint.</h2></body></html>',
     );
   }
 
-  // ── Step 5: Retrieve Ring Account ID via GET /v1/users/me ──────────────────
-  // The Account ID (data.id) is required to key the token store and
-  // correlate incoming webhook events (meta.account_id field).
-  // Response structure confirmed: { "data": { "id": "ava1.ring.account.XXXYYY", ... } }
   let accountId = 'unknown';
   try {
     const profileRes = await fetch(`${RING_API_BASE_URL}/v1/users/me`, {
@@ -302,31 +703,18 @@ router.get('/callback', async (req, res) => {
     if (profileRes.ok) {
       const profile = await profileRes.json();
       accountId = profile?.data?.id || 'unknown';
-    } else {
-      console.warn(`[Ring] /v1/users/me returned ${profileRes.status} — using 'unknown' account ID`);
     }
   } catch (profileErr) {
-    console.warn('[Ring] Could not fetch user profile:', profileErr.message);
+    console.warn('[Ring] Callback: could not fetch profile:', profileErr.message);
   }
 
-  // ── Step 6: Store tokens server-side only ──────────────────────────────────
-  // Access tokens and refresh tokens are NEVER returned to any caller.
   tokenStore.saveTokens(
     accountId,
     tokens.access_token,
     tokens.refresh_token,
-    tokens.expires_in || 14400,  // Ring docs: ~4 hour access token lifetime
+    tokens.expires_in || 14400,
   );
 
-  // ── Step 7: PATCH /v1/accounts/me/app-integrations — required ──────────────
-  // This finalizes the account link and activates device-level consents.
-  // Per Ring docs Step 5: without this PATCH, webhook notifications are
-  // not delivered and device API access remains inactive.
-  //
-  // account_identifier: an obfuscated identifier for the partner-side user.
-  // In a real system this would be a masked email of the logged-in partner user.
-  // For this prototype we use a clearly-labeled placeholder value.
-  // This does NOT represent a real user identity system.
   const PROTOTYPE_ACCOUNT_IDENTIFIER = 'sentinelgrid-prototype@demo.local';
 
   try {
@@ -341,100 +729,80 @@ router.get('/callback', async (req, res) => {
         body: JSON.stringify({
           status:             'completed',
           account_identifier: PROTOTYPE_ACCOUNT_IDENTIFIER,
-          // NOTE: In production, account_identifier should be a masked email
-          // of the authenticated partner user, e.g. "u***r@example.com".
-          // This prototype uses a static placeholder for demonstration only.
         }),
       },
     );
-
     if (patchRes.ok) {
-      console.log(`[Ring] Integration confirmed (completed) for account: ${accountId}`);
+      console.log(`[Ring] Callback: integration confirmed for account: ${accountId}`);
     } else {
-      const patchErr = await patchRes.text();
-      // Log but do not fail — tokens are stored; operator can retry linking
-      console.warn(`[Ring] Integration PATCH returned ${patchRes.status}: ${patchErr}`);
+      console.warn(`[Ring] Callback: PATCH returned ${patchRes.status}`);
     }
-  } catch (patchNetworkErr) {
-    console.warn('[Ring] Could not reach app-integrations endpoint:', patchNetworkErr.message);
+  } catch (patchErr) {
+    console.warn('[Ring] Callback: PATCH network error:', patchErr.message);
   }
 
-  console.log(`[Ring] Account linked — accountId: ${accountId}`);
+  console.log(`[Ring] Partner-Initiated linking complete — accountId: ${accountId}`);
 
-  // ── Step 8: Return safe confirmation — no tokens in response ───────────────
   res.send(`
     <html>
       <head><title>SentinelGrid — Ring Linked</title></head>
       <body style="font-family:sans-serif;max-width:480px;margin:40px auto;padding:20px">
         <h2>✅ Ring Account Linked</h2>
-        <p>Your Ring account has been successfully connected to SentinelGrid.</p>
+        <p>Your Ring account has been connected to SentinelGrid.</p>
         <p><strong>Account ID:</strong> ${escapeHtml(accountId)}</p>
         <hr>
         <p style="font-size:0.8em;color:#666">
-          PROTOTYPE: account_identifier is a static placeholder. In production
-          this would reflect the authenticated partner user identity.
+          PROTOTYPE: account_identifier is a static placeholder.
+          Events require human operator verification. No automatic action is taken.
         </p>
-        <p><a href="/">Open SentinelGrid Dashboard</a></p>
+        <p><a href="${escapeHtml(RING_APP_HOMEPAGE_URL)}">Open SentinelGrid Dashboard →</a></p>
       </body>
     </html>`);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ringWebhookHandler — exported separately for express.raw() wiring in index.js
+// ringWebhookHandler — exported separately for express.raw() wiring
 //
-// This function is NOT registered on the router. It is mounted in index.js
-// BEFORE the global express.json() call so the raw body Buffer is available
-// for HMAC-SHA256 signature verification.
+// POST /ring/webhook — Webhook URL registered in Ring Developer Console.
 //
-// POST /ring/webhook
-//
-// Signature verification — confirmed from official Ring Notifications docs:
+// Signature verification per official Ring Notifications docs:
 //   Header    : X-Signature: sha256=<hex_digest>
 //   Algorithm : HMAC-SHA256(RING_HMAC_SIGNATURE_KEY, raw_body_bytes).hexdigest()
-//   Comparison: crypto.timingSafeEqual — constant-time, prevents timing attacks
+//   Comparison: crypto.timingSafeEqual — constant-time
 //
-// Idempotency:
-//   meta.request_id is checked against processedWebhookIds before any
-//   processing. Ring retries receive HTTP 200 but produce no side effects.
+// NOTE: Webhooks use HEX encoding. Nonces (Account Link) use Base64URL.
+// Do not mix the two encodings — confirmed from Ring FAQ Q2.
 //
-// Webhook payload v1.1 structure — confirmed from official Ring docs:
-//   meta: { version, time, request_id, account_id }
-//   data: { id, type, attributes: { source, source_type, timestamp, sub_type? } }
+// Idempotency: meta.request_id deduplicated via processedWebhookIds Set.
 // ─────────────────────────────────────────────────────────────────────────────
 function ringWebhookHandler(req, res) {
-  // ── Guard: HMAC key must be configured ────────────────────────────────────
   if (!RING_HMAC_SIGNATURE_KEY) {
-    console.error('[Ring] RING_HMAC_SIGNATURE_KEY not set — webhook handler not operational');
-    // Respond 200 to avoid Ring treating the endpoint as permanently failed
+    console.error('[Ring] RING_HMAC_SIGNATURE_KEY not set — webhook not operational');
     return res.status(200).json({ received: false, reason: 'not_configured' });
   }
 
-  // ── Verify X-Signature header present ────────────────────────────────────
   const sigHeader = req.headers['x-signature'];
   if (!sigHeader) {
     console.warn('[Ring] Webhook rejected — missing X-Signature header');
     return res.status(401).json({ success: false, error: 'Missing X-Signature header' });
   }
 
-  // ── Verify raw body is a Buffer (set by express.raw()) ────────────────────
   const rawBody = req.body;
   if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
     console.warn('[Ring] Webhook rejected — body is not a raw Buffer');
     return res.status(400).json({ success: false, error: 'Invalid request body' });
   }
 
-  // ── Compute expected HMAC-SHA256 signature ────────────────────────────────
+  // Compute expected HMAC-SHA256 as HEX (webhooks use hex, not Base64URL)
   const expectedHex = crypto
     .createHmac('sha256', RING_HMAC_SIGNATURE_KEY)
     .update(rawBody)
     .digest('hex');
 
-  // Strip "sha256=" prefix from Ring's header value
   const receivedHex = sigHeader.startsWith('sha256=')
     ? sigHeader.slice(7)
     : sigHeader;
 
-  // Constant-time comparison — prevents timing-based oracle attacks
   let signatureValid = false;
   try {
     signatureValid = crypto.timingSafeEqual(
@@ -442,7 +810,6 @@ function ringWebhookHandler(req, res) {
       Buffer.from(receivedHex,  'hex'),
     );
   } catch {
-    // timingSafeEqual throws if buffer lengths differ — treat as invalid
     signatureValid = false;
   }
 
@@ -451,7 +818,6 @@ function ringWebhookHandler(req, res) {
     return res.status(401).json({ success: false, error: 'Invalid webhook signature' });
   }
 
-  // ── Parse verified payload ────────────────────────────────────────────────
   let payload;
   try {
     payload = JSON.parse(rawBody.toString('utf8'));
@@ -466,28 +832,21 @@ function ringWebhookHandler(req, res) {
   const deviceId  = payload?.data?.attributes?.source;
   const eventTime = payload?.meta?.time || new Date().toISOString();
 
-  // ── Idempotency: deduplicate Ring retries by request_id ───────────────────
   if (requestId && processedWebhookIds.has(requestId)) {
     console.log(`[Ring] Duplicate webhook — requestId ${requestId} already processed`);
     return res.status(200).json({ success: true, duplicate: true });
   }
 
-  // ── Respond HTTP 200 immediately ─────────────────────────────────────────
-  // Ring requires a response within 5 seconds. We respond first, then process.
+  // Respond 200 immediately — Ring requires response within 5 seconds
   res.status(200).json({ success: true, received: true });
 
-  // Mark as processed — before handling so concurrent retries are also blocked
   if (requestId) markWebhookProcessed(requestId);
 
   console.log(`[Ring] Webhook — type: ${eventType} | account: ${accountId} | requestId: ${requestId}`);
 
-  // ── Route to event handler ────────────────────────────────────────────────
   if (eventType === 'motion_detected') {
     handleMotionEvent({ accountId, deviceId, eventTime, requestId, payload });
   } else {
-    // All other event types are logged but do not generate incidents.
-    // Includes: button_press, device_added, device_removed,
-    //           device_online, device_offline, app_integration_added/removed
     console.log(`[Ring] Event type "${eventType}" received — no incident created`);
   }
 }
@@ -496,13 +855,9 @@ function ringWebhookHandler(req, res) {
 // handleMotionEvent
 //
 // Creates a SentinelGrid incident from a verified Ring motion_detected event.
-//
-// A Ring motion_detected webhook is a predefined safety-related trigger.
+// A Ring motion event is a predefined safety-related trigger.
 // It does NOT automatically indicate a crime has occurred.
-// The incident is set to OPEN and requires human operator verification.
-//
-// simulatedInput is false — this is a real device event, not simulated.
-// source is 'ring' — distinguishes from EventSimulator-triggered incidents.
+// Incident is OPEN and requires human operator verification.
 // ─────────────────────────────────────────────────────────────────────────────
 function handleMotionEvent({ accountId, deviceId, eventTime, requestId, payload }) {
   const USE_AWS  = process.env.USE_AWS === 'true';
@@ -522,36 +877,29 @@ function handleMotionEvent({ accountId, deviceId, eventTime, requestId, payload 
     location: {
       lat:   null,
       lng:   null,
-      // Ring webhooks do not include GPS coordinates.
-      // Device location requires a separate GET /v1/devices/{id}/location call.
       label: `Ring Device: ${deviceId || 'Unknown'} — location requires device API lookup`,
     },
-    evidenceUrl:    null,      // Evidence requires GET /v1/devices/{id}/media/...
+    evidenceUrl:    null,
     cameraId:       deviceId || 'RING-UNKNOWN',
     createdAt:      eventTime,
     updatedAt:      new Date().toISOString(),
     verifiedBy:     null,
-    simulatedInput: false,     // Real Ring device event — not simulated
-    source:         'ring',    // Distinguishes from EventSimulator incidents
+    simulatedInput: false,
+    source:         'ring',
     ringAccountId:  accountId,
     ringRequestId:  requestId,
   };
 
   if (USE_AWS) {
     // TODO: When USE_AWS=true, save to DynamoDB and publish SNS alert.
-    // Follow the same pattern as incidents.js — import dynamoService and snsService.
-    // Deferred to the AWS integration step.
+    // Same pattern as incidents.js. Deferred to the AWS integration step.
     console.log(`[Ring] USE_AWS=true — TODO: persist incident ${newIncident.id} to DynamoDB + SNS`);
-    mockStore.addIncident(newIncident);
-  } else {
-    mockStore.addIncident(newIncident);
   }
 
+  mockStore.addIncident(newIncident);
   console.log(
     `[Ring] Incident created — id: ${newIncident.id} | device: ${deviceId} | subType: ${subType || 'unspecified'}`,
   );
 }
 
-// Export the router (GET /ring/status, /ring/account-link, /ring/callback)
-// and the webhook handler separately (mounted in index.js with express.raw())
 module.exports = { router, ringWebhookHandler };
