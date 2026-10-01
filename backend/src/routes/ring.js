@@ -902,4 +902,104 @@ function handleMotionEvent({ accountId, deviceId, eventTime, requestId, payload 
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ring/devices
+//
+// Fetches devices accessible to the first CLAIMED Ring account.
+// Calls GET https://api.amazonvision.com/v1/devices using the stored access token.
+//
+// Returns real Ring device data if a linked account is available.
+// Returns a clear "not linked" message if no CLAIMED token exists.
+// Never returns access tokens or secrets in the response.
+//
+// Source: https://developer.amazon.com/docs/ring/api-documentation.html
+//         Device Endpoints — GET /v1/devices
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/devices', async (req, res) => {
+  // Find the first claimed (fully linked) account
+  const summary = tokenStore.getStatusSummary();
+  const claimedAccount = (summary.accounts || []).find(a => a.linkStatus === 'CLAIMED');
+
+  if (!claimedAccount) {
+    return res.json({
+      success: false,
+      linked: false,
+      message: 'Ring account not currently linked to SentinelGrid.',
+      devices: [],
+    });
+  }
+
+  // Retrieve the full token record to get the access token
+  const record = tokenStore.getTokens(claimedAccount.accountId);
+  if (!record || !record.accessToken) {
+    return res.json({
+      success: false,
+      linked: false,
+      message: 'Ring authorization expired. Re-link the Ring account.',
+      devices: [],
+    });
+  }
+
+  // Check token validity
+  if (!tokenStore.isAccessTokenValid(claimedAccount.accountId)) {
+    return res.json({
+      success: false,
+      linked: true,
+      message: 'Ring access token expired. Re-link the Ring account.',
+      devices: [],
+    });
+  }
+
+  // Call Ring device API
+  try {
+    const devRes = await fetch(
+      `${RING_API_BASE_URL}/v1/devices?include=status,capabilities,location`,
+      { headers: { Authorization: `Bearer ${record.accessToken}` } },
+    );
+
+    if (!devRes.ok) {
+      const errText = await devRes.text();
+      console.error(`[Ring] /v1/devices returned ${devRes.status}: ${errText}`);
+      return res.json({
+        success: false,
+        linked: true,
+        message: `Ring API temporarily unavailable (HTTP ${devRes.status}).`,
+        devices: [],
+      });
+    }
+
+    const body = await devRes.json();
+
+    // Normalise the JSON:API response — return only safe, non-sensitive fields
+    const devices = (body.data || []).map(d => ({
+      id:          d.id,
+      type:        d.type,
+      name:        d.attributes?.name || d.attributes?.description || 'Ring Device',
+      online:      d.relationships?.status?.data?.attributes?.online ?? null,
+      location:    d.relationships?.location?.data?.attributes?.address_1 || null,
+    }));
+
+    console.log(`[Ring] /v1/devices — returned ${devices.length} device(s) for account ${claimedAccount.accountId}`);
+
+    res.json({
+      success: true,
+      linked:  true,
+      accountId: claimedAccount.accountId,
+      deviceCount: devices.length,
+      devices,
+      note: devices.length === 0
+        ? 'No Ring devices available to this account.'
+        : undefined,
+    });
+  } catch (networkErr) {
+    console.error('[Ring] Network error fetching devices:', networkErr.message);
+    res.json({
+      success: false,
+      linked:  true,
+      message: 'Ring API temporarily unavailable.',
+      devices: [],
+    });
+  }
+});
+
 module.exports = { router, ringWebhookHandler };

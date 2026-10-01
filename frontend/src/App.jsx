@@ -23,8 +23,10 @@ import IncidentFeed from './components/IncidentFeed';
 import IncidentDetail from './components/IncidentDetail';
 import EventSimulator from './components/EventSimulator';
 import ActivityLog from './components/ActivityLog';
+import RingStatusPanel from './components/RingStatusPanel';
 
 const API_BASE = 'https://sentinelgrid-2l30.onrender.com/incidents';
+const BACKEND_HEALTH = 'https://sentinelgrid-2l30.onrender.com/health';
 
 export default function App() {
   const [incidents, setIncidents] = useState([]);
@@ -32,6 +34,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [logs, setLogs] = useState([]);
+  // Tracks whether backend is reachable and its reported mode
+  const [backendMode, setBackendMode] = useState('connecting...');
 
   // ── Add a timestamped entry to the activity log ───────────────────────────
   const addLog = useCallback((type, incident, operator = null) => {
@@ -45,6 +49,14 @@ export default function App() {
         timestamp: new Date().toISOString(),
       },
     ]);
+  }, []);
+
+  // ── Fetch backend mode (health check) ────────────────────────────────────
+  useEffect(() => {
+    fetch(BACKEND_HEALTH)
+      .then((r) => r.json())
+      .then((d) => setBackendMode(d.mode || 'Unknown'))
+      .catch(() => setBackendMode('unreachable'));
   }, []);
 
   // ── Fetch all incidents from the backend ──────────────────────────────────
@@ -134,9 +146,9 @@ export default function App() {
             <span className="inline-block w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             LIVE
           </div>
-          {/* System mode indicator */}
+          {/* System mode indicator — driven by live health check */}
           <span className="text-xs bg-gray-800 text-gray-400 border border-gray-600 px-2 py-1 rounded font-mono">
-            LOCAL MOCK MODE
+            {backendMode === 'connecting...' ? 'CONNECTING…' : backendMode.toUpperCase()}
           </span>
           {/* Prototype badge */}
           <span className="text-xs bg-yellow-900 text-yellow-300 border border-yellow-700 px-2 py-1 rounded font-mono">
@@ -164,7 +176,7 @@ export default function App() {
       {/* ── Main Content ── */}
       <main className="flex flex-1 gap-4 p-4 overflow-hidden">
 
-        {/* Left panel — incident feed */}
+        {/* Left panel — incident feed + Ring status */}
         <div className="w-96 flex-shrink-0 flex flex-col gap-4 overflow-y-auto">
           <IncidentFeed
             incidents={incidents}
@@ -172,6 +184,8 @@ export default function App() {
             selectedId={selectedIncident?.id}
             onSelect={setSelectedIncident}
           />
+          {/* Ring API integration status — real data only, not local simulation */}
+          <RingStatusPanel />
         </div>
 
         {/* Right panel — incident detail + activity log */}
